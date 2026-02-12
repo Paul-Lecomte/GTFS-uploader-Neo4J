@@ -25,9 +25,44 @@
 
 - Fast, streamed ingestion of GTFS CSV files into Neo4j
 - Efficient batching and transaction management for large datasets
-- Support for common GTFS files (stops, routes, trips, stop_times, shapes, transfers, calendar)
+- Support for common GTFS files (stops, routes, trips, stop_times, shapes, transfers, calendar, calendar_dates)
 - Configurable mapping and simple CLI usage
 - Minimal dependencies and easy to customize
+
+---
+
+## Service calendars
+
+If your GTFS includes `calendar.txt` and/or `calendar_dates.txt`, the importer creates `Service` and `CalendarDate` nodes and links `Trip` to `Service` via `[:HAS_SERVICE]`. This makes it easy to query trips active on a specific date.
+
+Example Cypher (active trips for a given date):
+
+```cypher
+WITH date($date) AS d, toString(date($date)) AS ds
+MATCH (s:Service)
+OPTIONAL MATCH (s)-[m:MODIFIED_ON]->(:CalendarDate {date: ds})
+WITH s, d, ds, m,
+CASE d.dayOfWeek
+  WHEN 1 THEN s.monday
+  WHEN 2 THEN s.tuesday
+  WHEN 3 THEN s.wednesday
+  WHEN 4 THEN s.thursday
+  WHEN 5 THEN s.friday
+  WHEN 6 THEN s.saturday
+  WHEN 7 THEN s.sunday
+END AS weekly
+WITH s, m, weekly,
+CASE
+  WHEN m.type = 1 THEN true
+  WHEN m.type = 2 THEN false
+  ELSE weekly
+END AS active
+WHERE active = true
+  AND (s.start_date IS NULL OR s.start_date <= ds)
+  AND (s.end_date IS NULL OR s.end_date >= ds)
+MATCH (t:Trip)-[:HAS_SERVICE]->(s)
+RETURN t;
+```
 
 ---
 

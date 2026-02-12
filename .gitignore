@@ -1,0 +1,9 @@
+.idea
+.git
+.idea/GTFS-uploader-Neo4J.iml
+.idea/copilot.data.migration.ask2agent.xml
+.idea/inspectionProfiles/
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+__pycache__/

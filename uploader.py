@@ -42,6 +42,9 @@ class GNUploader(object):
     agency_constraint_query = "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Agency) REQUIRE (a.agency_id) IS UNIQUE"
     stop_constraint_query = "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Stop) REQUIRE (s.stop_id) IS UNIQUE"
     stop_times_constraint_query = "CREATE CONSTRAINT IF NOT EXISTS FOR (st:Stop_times) REQUIRE ((st.trip_id, st.stop_sequence)) IS NODE KEY"
+    service_constraint_query = "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Service) REQUIRE (s.service_id) IS UNIQUE"
+    calendar_date_constraint_query = "CREATE CONSTRAINT IF NOT EXISTS FOR (d:CalendarDate) REQUIRE (d.date) IS UNIQUE"
+    trip_service_index_query = "CREATE INDEX IF NOT EXISTS FOR (t:Trip) ON (t.service_id)"
 
     # Fallback if composite node key isn't available: at least index the pairing
     stop_times_pair_index_query = "CREATE INDEX IF NOT EXISTS FOR (st:Stop_times) ON (st.trip_id, st.stop_sequence)"
@@ -100,6 +103,10 @@ class GNUploader(object):
         self.stop_times = os.path.join(self.gtfs_tmp_path, "stop_times" + self.gtfs_file_extension)
         self.trips = os.path.join(self.gtfs_tmp_path, "trips" + self.gtfs_file_extension)
         self.agencies = os.path.join(self.gtfs_tmp_path, "agency" + self.gtfs_file_extension)
+        self.calendar = os.path.join(self.gtfs_tmp_path, "calendar" + self.gtfs_file_extension)
+        self.calendar_dates = os.path.join(self.gtfs_tmp_path, "calendar_dates" + self.gtfs_file_extension)
+        self.has_calendar = os.path.isfile(self.calendar)
+        self.has_calendar_dates = os.path.isfile(self.calendar_dates)
         self.__validate_gtfs_files_in_dir()
         # connect to neo4j service
         self.driver = self.__connect_to_neo4j()
@@ -147,6 +154,13 @@ class GNUploader(object):
         if not os.path.isfile(self.agencies):
             raise SystemExit("Could not find agency.txt file. Aborting")
 
+        if not self.has_calendar and not self.has_calendar_dates:
+            print("Warning: calendar.txt and calendar_dates.txt are missing; no service availability will be imported.")
+        elif not self.has_calendar:
+            print("Warning: calendar.txt is missing; only calendar_dates.txt exceptions will be imported.")
+        elif not self.has_calendar_dates:
+            print("Warning: calendar_dates.txt is missing; only weekly calendar will be imported.")
+
     def execute(self) -> None:
         start_time = time()
 
@@ -162,6 +176,17 @@ class GNUploader(object):
         print(f"Trips imported.")
         self.__import_stops()
         print(f"Stops imported.")
+
+        if self.has_calendar:
+            self.__import_calendar()
+            print("Calendar imported.")
+        if self.has_calendar_dates:
+            self.__import_calendar_dates()
+            print("Calendar dates imported.")
+        if self.has_calendar or self.has_calendar_dates:
+            self.__link_trips_to_services()
+            print("Trips linked to services.")
+
         self.__import_stop_times()
         print(f"Stop_times imported.")
 
@@ -193,6 +218,13 @@ class GNUploader(object):
             cleaned[k] = v
         return cleaned
 
+    def _parse_yyyymmdd(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        if len(value) != 8 or not value.isdigit():
+            return value
+        return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
+
     def _iter_batches(self, iterable: Iterable[Dict[str, Any]], batch_size: int) -> Iterable[List[Dict[str, Any]]]:
         batch: List[Dict[str, Any]] = []
         for item in iterable:
@@ -210,6 +242,9 @@ class GNUploader(object):
             self.run_query(self.route_constraint_query)
             self.run_query(self.agency_constraint_query)
             self.run_query(self.stop_constraint_query)
+            self.run_query(self.service_constraint_query)
+            self.run_query(self.calendar_date_constraint_query)
+            self.run_query(self.trip_service_index_query)
             # optional: create a node key for composite uniqueness for stop_times (trip_id + stop_sequence)
             try:
                 self.run_query(self.stop_times_constraint_query)
@@ -518,63 +553,31 @@ class GNUploader(object):
                 if rel_batch_num % 50 == 0:
                     print(f"Trip relations: {rel_written:,} rows processed")
 
-    def __connect_route_trip_uses_full_scan(self) -> None:
-        """Optional safety net: create missing Route-[:USES]->Trip relationships from stored Trip.route_id.
-
-        This can be useful if you want to skip pass 2 for debugging, or if you ran partial imports.
-        It can be slower on very large datasets, so keep it optional.
-        """
-        try:
-            q = (
-                "MATCH (t:Trip)\n"
-                "WHERE t.route_id IS NOT NULL\n"
-                "MATCH (r:Route {route_id: t.route_id})\n"
-                "MERGE (r)-[:USES]->(t)\n"
-            )
-            self.run_query(q)
-        except Exception as e:
-            print(f"Error when creating Route->Trip relationships (full scan): {e}")
-
     def __import_stop_times(self) -> None:
-        """Stop_times import optimized for very large files.
-
-        Single pass over stop_times.txt: create Stop_times node + link to Trip and Stop in the same Cypher.
-
-        Notes:
-        - In fast mode, we use CREATE (best throughput).
-        - In non-fast mode, we MERGE the Stop_times node (idempotent) and MERGE relationships.
-        - We intentionally avoid reading stop_times.txt twice.
-        """
+        """Batch import stop_times and create relationships to Trip and Stop."""
 
         if self.fast_create:
-            query = (
+            query_nodes = (
                 "UNWIND $rows AS row\n"
-                "CREATE (st:Stop_times {\n"
-                "  trip_id: row.trip_id,\n"
-                "  stop_sequence: row.stop_sequence,\n"
-                "  arrival_time: row.arrival_time,\n"
-                "  departure_time: row.departure_time,\n"
-                "  stop_id: row.stop_id\n"
-                "})\n"
-                "WITH st, row\n"
-                "MATCH (t:Trip {trip_id: row.trip_id})\n"
-                "MATCH (s:Stop {stop_id: row.stop_id})\n"
-                "CREATE (st)-[:PART_OF_TRIP]->(t)\n"
-                "CREATE (st)-[:LOCATED_AT]->(s)\n"
+                "CREATE (st:Stop_times {trip_id: row.trip_id, stop_sequence: row.stop_sequence})\n"
+                "SET st += row.props\n"
             )
         else:
-            query = (
+            query_nodes = (
                 "UNWIND $rows AS row\n"
                 "MERGE (st:Stop_times {trip_id: row.trip_id, stop_sequence: row.stop_sequence})\n"
-                "SET st.arrival_time = row.arrival_time\n"
-                "SET st.departure_time = row.departure_time\n"
-                "SET st.stop_id = row.stop_id\n"
-                "WITH st, row\n"
-                "MATCH (t:Trip {trip_id: row.trip_id})\n"
-                "MATCH (s:Stop {stop_id: row.stop_id})\n"
-                "MERGE (st)-[:PART_OF_TRIP]->(t)\n"
-                "MERGE (st)-[:LOCATED_AT]->(s)\n"
+                "SET st += row.props\n"
             )
+
+        rel_keyword = "CREATE" if self.fast_create else "MERGE"
+        query_rels = (
+            "UNWIND $rows AS row\n"
+            "MATCH (t:Trip {trip_id: row.trip_id})\n"
+            "MATCH (s:Stop {stop_id: row.stop_id})\n"
+            "MATCH (st:Stop_times {trip_id: row.trip_id, stop_sequence: row.stop_sequence})\n"
+            f"{rel_keyword} (st)-[:PART_OF_TRIP]->(t)\n"
+            f"{rel_keyword} (st)-[:AT_STOP]->(s)\n"
+        )
 
         def _rows() -> Iterable[Dict[str, Any]]:
             with open(self.stop_times, 'r', newline='', encoding='utf8') as fh:
@@ -589,55 +592,102 @@ class GNUploader(object):
                         continue
 
                     try:
-                        seq_val = int(stop_sequence)
+                        stop_sequence_val = int(stop_sequence)
                     except Exception:
                         self.rows_skipped += 1
                         continue
 
-                    # Keep payload minimal; avoid unnecessary props for speed.
+                    def _to_int(v: Optional[str]) -> Optional[int]:
+                        if v is None:
+                            return None
+                        return int(v) if str(v).isdigit() else None
+
+                    def _to_float(v: Optional[str]) -> Optional[float]:
+                        if v is None:
+                            return None
+                        try:
+                            return float(v)
+                        except Exception:
+                            return None
+
+                    props = {
+                        'trip_id': trip_id,
+                        'stop_id': stop_id,
+                        'stop_sequence': stop_sequence_val,
+                        'arrival_time': row.get('arrival_time'),
+                        'departure_time': row.get('departure_time'),
+                        'stop_headsign': row.get('stop_headsign'),
+                        'pickup_type': _to_int(row.get('pickup_type')),
+                        'drop_off_type': _to_int(row.get('drop_off_type')),
+                        'shape_dist_traveled': _to_float(row.get('shape_dist_traveled')),
+                        'timepoint': _to_int(row.get('timepoint')),
+                    }
+                    props = {k: v for k, v in props.items() if v is not None}
+
                     yield {
                         'trip_id': trip_id,
                         'stop_id': stop_id,
-                        'stop_sequence': seq_val,
-                        'arrival_time': row.get('arrival_time'),
-                        'departure_time': row.get('departure_time'),
+                        'stop_sequence': stop_sequence_val,
+                        'props': props,
                     }
 
         with self.driver.session() as session:
+            # pass 1: nodes
             batch_num = 0
             rows_written = 0
             for batch in self._iter_batches(_rows(), self.stop_times_batch_size):
                 batch_num += 1
                 rows_written += len(batch)
-                session.execute_write(lambda tx, rows: tx.run(query, rows=rows), batch)
-                # nodes + 2 relationships per row (expected)
+                session.execute_write(lambda tx, rows: tx.run(query_nodes, rows=rows), batch)
                 self.node_ctr += len(batch)
-                self.relationship_ctr += 2 * len(batch)
 
                 if batch_num % 50 == 0:
                     print(f"Stop_times: {rows_written:,} rows processed, skipped={self.rows_skipped:,}")
 
-    def __connect_stop_times_sequences(self):
-        """Create PRECEDES relationships efficiently.
+            # pass 2: relationships
+            def _rel_rows() -> Iterable[Dict[str, Any]]:
+                with open(self.stop_times, 'r', newline='', encoding='utf8') as fh:
+                    reader = csv.DictReader(fh, delimiter=self.csv_delim)
+                    for raw in reader:
+                        row = self._normalize_row(raw)
+                        trip_id = row.get('trip_id')
+                        stop_id = row.get('stop_id')
+                        stop_sequence = row.get('stop_sequence')
+                        if not trip_id or not stop_id or stop_sequence is None:
+                            continue
+                        try:
+                            stop_sequence_val = int(stop_sequence)
+                        except Exception:
+                            continue
+                        yield {
+                            'trip_id': trip_id,
+                            'stop_id': stop_id,
+                            'stop_sequence': stop_sequence_val,
+                        }
 
-        Do NOT run a DB-wide self-join on Stop_times for millions of rows.
-        Instead, stream stop_times.txt and connect consecutive stop_sequence within each trip.
+            rel_batch_num = 0
+            rel_written = 0
+            for rel_batch in self._iter_batches(_rel_rows(), self.stop_times_batch_size):
+                rel_batch_num += 1
+                rel_written += len(rel_batch)
+                session.execute_write(lambda tx, rows: tx.run(query_rels, rows=rows), rel_batch)
+                self.relationship_ctr += (len(rel_batch) * 2)
 
-        Assumption (GTFS typical): stop_times.txt is sorted by (trip_id, stop_sequence).
-        If it isn't sorted, this method will miss PRECEDES links.
-        """
+                if rel_batch_num % 50 == 0:
+                    print(f"Stop_times relations: {rel_written:,} rows processed")
+
+    def __connect_stop_times_sequences(self) -> None:
+        """Create PRECEDES edges by streaming stop_times in file order (assumes sorted by trip_id, stop_sequence)."""
 
         query = (
             "UNWIND $rows AS row\n"
-            "MATCH (a:Stop_times {trip_id: row.trip_id, stop_sequence: row.seq_a})\n"
-            "MATCH (b:Stop_times {trip_id: row.trip_id, stop_sequence: row.seq_b})\n"
-            "MERGE (a)-[:PRECEDES]->(b)\n"
+            "MATCH (s1:Stop_times {trip_id: row.trip_id, stop_sequence: row.stop_sequence})\n"
+            "MATCH (s2:Stop_times {trip_id: row.trip_id, stop_sequence: row.next_stop_sequence})\n"
+            "MERGE (s1)-[:PRECEDES]->(s2)\n"
         )
 
-        def _pair_rows() -> Iterable[Dict[str, Any]]:
-            prev_trip: Optional[str] = None
-            prev_seq: Optional[int] = None
-
+        def _rows() -> Iterable[Dict[str, Any]]:
+            last_by_trip: Dict[str, int] = {}
             with open(self.stop_times, 'r', newline='', encoding='utf8') as fh:
                 reader = csv.DictReader(fh, delimiter=self.csv_delim)
                 for raw in reader:
@@ -647,30 +697,149 @@ class GNUploader(object):
                     if not trip_id or stop_sequence is None:
                         continue
                     try:
-                        seq_val = int(stop_sequence)
+                        stop_sequence_val = int(stop_sequence)
                     except Exception:
                         continue
 
-                    if prev_trip == trip_id and prev_seq is not None:
-                        # Only link immediate sequence neighbors.
-                        # If there are gaps, PRECEDES won't be created for missing sequences (which is correct).
-                        if seq_val == prev_seq + 1:
-                            yield {'trip_id': trip_id, 'seq_a': prev_seq, 'seq_b': seq_val}
-
-                    prev_trip = trip_id
-                    prev_seq = seq_val
+                    if trip_id in last_by_trip:
+                        yield {
+                            'trip_id': trip_id,
+                            'stop_sequence': last_by_trip[trip_id],
+                            'next_stop_sequence': stop_sequence_val,
+                        }
+                    last_by_trip[trip_id] = stop_sequence_val
 
         with self.driver.session() as session:
             rel_batch_num = 0
             rel_written = 0
-            for rel_batch in self._iter_batches(_pair_rows(), self.stop_times_batch_size):
+            for rel_batch in self._iter_batches(_rows(), self.stop_times_batch_size):
                 rel_batch_num += 1
                 rel_written += len(rel_batch)
                 session.execute_write(lambda tx, rows: tx.run(query, rows=rows), rel_batch)
                 self.relationship_ctr += len(rel_batch)
 
                 if rel_batch_num % 50 == 0:
-                    print(f"PRECEDES: {rel_written:,} relations processed")
+                    print(f"PRECEDES: {rel_written:,} rows processed")
+
+    def __import_calendar(self) -> None:
+        if self.fast_create:
+            query = (
+                "UNWIND $rows AS row\n"
+                "CREATE (s:Service {service_id: row.service_id})\n"
+                "SET s += row.props\n"
+            )
+        else:
+            query = (
+                "UNWIND $rows AS row\n"
+                "MERGE (s:Service {service_id: row.service_id})\n"
+                "SET s += row.props\n"
+            )
+
+        def _rows() -> Iterable[Dict[str, Any]]:
+            with open(self.calendar, 'r', newline='', encoding='utf8') as fh:
+                reader = csv.DictReader(fh, delimiter=self.csv_delim)
+                for raw in reader:
+                    row = self._normalize_row(raw)
+                    service_id = row.get('service_id')
+                    if not service_id:
+                        self.rows_skipped += 1
+                        continue
+
+                    def _to_bool(v: Optional[str]) -> Optional[bool]:
+                        if v is None:
+                            return None
+                        if str(v).isdigit():
+                            return bool(int(v))
+                        return None
+
+                    props = {
+                        'service_id': service_id,
+                        'monday': _to_bool(row.get('monday')),
+                        'tuesday': _to_bool(row.get('tuesday')),
+                        'wednesday': _to_bool(row.get('wednesday')),
+                        'thursday': _to_bool(row.get('thursday')),
+                        'friday': _to_bool(row.get('friday')),
+                        'saturday': _to_bool(row.get('saturday')),
+                        'sunday': _to_bool(row.get('sunday')),
+                        'start_date': self._parse_yyyymmdd(row.get('start_date')),
+                        'end_date': self._parse_yyyymmdd(row.get('end_date')),
+                    }
+                    props = {k: v for k, v in props.items() if v is not None}
+
+                    yield {'service_id': service_id, 'props': props}
+
+        with self.driver.session() as session:
+            for batch in self._iter_batches(_rows(), self.batch_size):
+                session.execute_write(lambda tx, rows: tx.run(query, rows=rows), batch)
+                self.node_ctr += len(batch)
+
+    def __import_calendar_dates(self) -> None:
+        query = (
+            "UNWIND $rows AS row\n"
+            "MERGE (s:Service {service_id: row.service_id})\n"
+            "MERGE (d:CalendarDate {date: row.date})\n"
+            "MERGE (s)-[:MODIFIED_ON {type: row.exception_type}]->(d)\n"
+        )
+
+        def _rows() -> Iterable[Dict[str, Any]]:
+            with open(self.calendar_dates, 'r', newline='', encoding='utf8') as fh:
+                reader = csv.DictReader(fh, delimiter=self.csv_delim)
+                for raw in reader:
+                    row = self._normalize_row(raw)
+                    service_id = row.get('service_id')
+                    date = self._parse_yyyymmdd(row.get('date'))
+                    exception_type = row.get('exception_type')
+                    if not service_id or not date or exception_type is None:
+                        self.rows_skipped += 1
+                        continue
+                    try:
+                        exception_val = int(exception_type)
+                    except Exception:
+                        self.rows_skipped += 1
+                        continue
+
+                    yield {
+                        'service_id': service_id,
+                        'date': date,
+                        'exception_type': exception_val,
+                    }
+
+        with self.driver.session() as session:
+            for batch in self._iter_batches(_rows(), self.batch_size):
+                session.execute_write(lambda tx, rows: tx.run(query, rows=rows), batch)
+                self.relationship_ctr += len(batch)
+
+    def __link_trips_to_services(self) -> None:
+        rel_keyword = "CREATE" if self.fast_create else "MERGE"
+        query = (
+            "UNWIND $rows AS row\n"
+            "MATCH (t:Trip {trip_id: row.trip_id})\n"
+            "MATCH (s:Service {service_id: row.service_id})\n"
+            f"{rel_keyword} (t)-[:HAS_SERVICE]->(s)\n"
+        )
+
+        def _rows() -> Iterable[Dict[str, Any]]:
+            with open(self.trips, 'r', newline='', encoding='utf8') as fh:
+                reader = csv.DictReader(fh, delimiter=self.csv_delim)
+                for raw in reader:
+                    row = self._normalize_row(raw)
+                    trip_id = row.get('trip_id')
+                    service_id = row.get('service_id')
+                    if not trip_id or not service_id:
+                        continue
+                    yield {'trip_id': trip_id, 'service_id': service_id}
+
+        with self.driver.session() as session:
+            rel_batch_num = 0
+            rel_written = 0
+            for rel_batch in self._iter_batches(_rows(), self.batch_size):
+                rel_batch_num += 1
+                rel_written += len(rel_batch)
+                session.execute_write(lambda tx, rows: tx.run(query, rows=rows), rel_batch)
+                self.relationship_ctr += len(rel_batch)
+
+                if rel_batch_num % 50 == 0:
+                    print(f"Trip services: {rel_written:,} rows processed")
 
 
 if __name__ == "__main__":
