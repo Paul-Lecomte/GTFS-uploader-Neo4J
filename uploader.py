@@ -9,7 +9,7 @@ property name typos, unsafe string concatenation when building Cypher queries, .
 Usage (example):
     python uploader.py path/to/gtfs.zip username password bolt://localhost:7687
 
-Requirements: add `neo4j` to your environment (pip install neo4j)
+Requirements: add `neo4j` to your environment (pip install neo4j), and ensure your Neo4j instance is running and accessible with the provided credentials.
 """
 
 # Resilient dynamic import: if neo4j driver isn't installed, provide a clear error at runtime.
