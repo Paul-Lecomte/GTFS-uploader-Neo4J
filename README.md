@@ -148,6 +148,6 @@ Built for speed and scale. Thanks to the Neo4j community for tooling inspiration
 
 ## License
 
-This project is licensed under the MIT License — see the `LICENSE` file for details.
+This project is licensed under the MIT License — See the [LICENSE](./LICENSE) file for details.
 
 © 2026 Paul Lecomte
