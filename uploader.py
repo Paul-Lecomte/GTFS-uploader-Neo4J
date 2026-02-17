@@ -13,6 +13,7 @@ Requirements: add `neo4j` to your environment (pip install neo4j), and ensure yo
 """
 
 # Resilient dynamic import: if neo4j driver isn't installed, provide a clear error at runtime.
+# We do this instead of a hard import at the top level to allow the script to be imported in environments where the driver isn't available, as long as the uploader isn't executed.
 import importlib
 try:
     _neo4j_mod = importlib.import_module('neo4j')
