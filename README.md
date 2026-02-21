@@ -5,11 +5,15 @@
 <p align="center">
   <strong>Very fast GTFS data uploader for Neo4J</strong><br>
   <a href="#">
-    <img alt="GitHub stars" src="https://img.shields.io/github/stars/your-username/GTFS-uploader-Neo4J?style=social">
+    <img alt="GitHub stars" src="https://img.shields.io/github/stars/Paul-Lecomte/GTFS-uploader-Neo4J?style=social">
+  </a>
+  <a href="#">
+    <img alt="GitHub forks" src="https://img.shields.io/github/forks/Paul-Lecomte/GTFS-uploader-Neo4J?style=social">
   </a>
   <img alt="Tech Stack" src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white">
   <img alt="Tech Stack" src="https://img.shields.io/badge/Neo4j-CC0033?logo=neo4j&logoColor=white">
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg">
+  <img alt="Clones" src="https://img.shields.io/badge/Clones-Statique--GitHub%20Insights-orange">
 </p>
 
 ---
