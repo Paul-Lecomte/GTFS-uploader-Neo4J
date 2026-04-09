@@ -1,5 +1,9 @@
 <!-- PROJECT TITLE & BADGES -->
 
+<p align="center">
+  <img src="./logo.png" alt="GTFS-uploader-Neo4J logo" width="500">
+</p>
+
 <h1 align="center">GTFS-uploader-Neo4J</h1>
 
 <p align="center">
